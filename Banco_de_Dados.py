@@ -2,6 +2,7 @@ import json
 import urllib.parse
 from datetime import date
 
+import certifi
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
@@ -10,13 +11,38 @@ from sqlalchemy.dialects.mysql import DOUBLE, LONGTEXT, VARCHAR
 from urllib3.util.retry import Retry
 
 # --- CONFIGURAÇÃO DE ACESSO AO BANCO DE DADOS ---
-usuario = 'root'
-senha = urllib.parse.quote_plus('91574455Ab@2026')
-host = 'localhost'
-porta = '3306'
+USAR_NUVEM = True  # True = TiDB Cloud | False = MySQL local
+
+if USAR_NUVEM:
+    usuario = 'QQPXk1HfakbEwks.root'
+    senha = urllib.parse.quote_plus('COLE_A_NOVA_SENHA_AQUI')
+    host = 'gateway01.sa-east-1.prod.aws.tidbcloud.com'
+    porta = '4000'
+else:
+    usuario = 'root'
+    senha = urllib.parse.quote_plus('91574455Ab@2026')
+    host = 'localhost'
+    porta = '3306'
+
 banco = 'tgi_ibge'
 
-engine = create_engine(f'mysql+pymysql://{usuario}:{senha}@{host}:{porta}/{banco}')
+# Bancos na nuvem exigem conexão com SSL
+connect_args = {"ssl": {"ca": certifi.where()}} if USAR_NUVEM else {}
+
+# Cria o banco se ainda não existir (o TiDB Cloud vem só com o banco 'sys' e outros de sistema)
+_engine_admin = create_engine(
+    f'mysql+pymysql://{usuario}:{senha}@{host}:{porta}/',
+    connect_args=connect_args,
+)
+with _engine_admin.begin() as _conn:
+    _conn.execute(text(f"CREATE DATABASE IF NOT EXISTS {banco}"))
+_engine_admin.dispose()
+
+engine = create_engine(
+    f'mysql+pymysql://{usuario}:{senha}@{host}:{porta}/{banco}',
+    connect_args=connect_args,
+    pool_pre_ping=True,
+)
 
 # --- CONFIGURAÇÃO DA API ---
 API = "https://servicodados.ibge.gov.br/api"
@@ -193,10 +219,16 @@ def carregar_fato_ipca(table_name):
             "periodo_id": VARCHAR(6),
             "valor_indice": DOUBLE,
         }
-        df_fato.to_sql(
-            table_name, con=engine, if_exists="replace", index=False,
-            dtype=dtype_fato, chunksize=5000, method="multi",
-        )
+        # Grava em lotes: cada lote é uma transação separada. Gravar milhões de linhas numa
+        # transação só funciona no MySQL local; bancos distribuídos (TiDB) rejeitam transações grandes.
+        tamanho_lote = 20000
+        for i in range(0, len(df_fato), tamanho_lote):
+            df_fato.iloc[i:i + tamanho_lote].to_sql(
+                table_name, con=engine,
+                if_exists="replace" if i == 0 else "append",
+                index=False, dtype=dtype_fato, chunksize=5000, method="multi",
+            )
+            print(f"   Gravadas {min(i + tamanho_lote, len(df_fato))}/{len(df_fato)} linhas...")
 
         # Índice para acelerar os joins/filtros do Power BI
         try:
