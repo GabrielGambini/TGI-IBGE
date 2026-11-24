@@ -11,7 +11,7 @@ pd.set_option("display.max_columns", 20)
 pd.set_option("display.max_colwidth", 70)
 
 consultas = {
-    "1) Cobertura da fato por nível territorial (esperado: N1=1, N7=10, N6=6 locais)": """
+    "1) Cobertura da fato do IPCA-15 por nível territorial": """
         SELECT nivel_territorial,
                COUNT(DISTINCT localidade_id) AS locais,
                COUNT(*) AS linhas,
@@ -23,14 +23,16 @@ consultas = {
     "2) Logs do pipeline (procure por Aviso ou Erro)": """
         SELECT * FROM logs_pipeline
     """,
-    "3) IPCA Brasil, índice geral, últimos períodos (compare com o divulgado pelo IBGE)": """
-        SELECT indicador_nome, periodo_id, valor_indice
+    "3) IPCA-15 Brasil, índice geral, últimos períodos (compare com o divulgado pelo IBGE)": """
+        SELECT indicador_id, indicador_nome, periodo_id, valor_indice
         FROM fat_ipca_brasil
-        WHERE nivel_territorial = 'N1' AND categoria_nome LIKE '%Índice geral%'
-        ORDER BY periodo_id DESC, indicador_nome
-        LIMIT 16
+        WHERE localidade_id = '1'
+          AND categoria_id = '7169'
+          AND indicador_id IN ('355', '356', '1120')
+        ORDER BY periodo_id DESC, indicador_id
+        LIMIT 6
     """,
-    "4) Exemplo de como vêm os nomes das categorias": """
+    "4) Categorias do agregado IPCA-15": """
         SELECT DISTINCT categoria_id, categoria_nome
         FROM fat_ipca_brasil
         ORDER BY categoria_id

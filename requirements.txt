@@ -1,4 +1,6 @@
+certifi
 pandas
 requests
 SQLAlchemy
 PyMySQL
+urllib3

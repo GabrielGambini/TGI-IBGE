@@ -1,6 +1,5 @@
 import json
 import urllib.parse
-from datetime import date
 
 import certifi
 import pandas as pd
@@ -46,11 +45,11 @@ engine = create_engine(
 
 # --- CONFIGURAÇÃO DA API ---
 API = "https://servicodados.ibge.gov.br/api"
-AGREGADO_IPCA = 7060  # Tabela 7060 do SIDRA: IPCA (a partir de jan/2020)
-# Brasil (N1) + Regiões Metropolitanas (N7) + Municípios (N6) = as 16 áreas do IPCA + total nacional
+AGREGADO_IPCA15 = 7062  # IPCA-15 detalhado: mensal, acumulados e grupos
+# Brasil (N1), regiões metropolitanas (N7) e municípios (N6) disponíveis no agregado
 LOCALIDADES = "N1[all]|N7[all]|N6[all]"
 CLASSIFICACAO = "315[all]"  # índice geral, grupos, subgrupos, itens e subitens
-ANO_INICIO = 2020
+PERIODO_INICIO = "202002"  # primeiro período disponível no agregado 7062
 MESES_POR_REQUISICAO = 3  # evita estourar o limite de valores por requisição do SIDRA
 
 http = requests.Session()
@@ -129,27 +128,29 @@ def converter_valor(v):
         return None
 
 
-def lista_periodos(ano_inicio):
-    hoje = date.today()
-    return [
-        f"{ano}{mes:02d}"
-        for ano in range(ano_inicio, hoje.year + 1)
-        for mes in range(1, 13)
-        if (ano, mes) <= (hoje.year, hoje.month)
-    ]
+def lista_periodos(base):
+    periodos_disponiveis = buscar_json(f"{base}/periodos")
+    periodos = sorted(
+        str(periodo["id"])
+        for periodo in periodos_disponiveis
+        if str(periodo["id"]) >= PERIODO_INICIO
+    )
+    if not periodos:
+        raise RuntimeError(f"Nenhum período disponível a partir de {PERIODO_INICIO}.")
+    return periodos
 
 
-def carregar_fato_ipca(table_name):
-    """Fato do IPCA: Brasil + RMs + municípios, todas as variáveis e todas as categorias."""
+def carregar_fato_ipca15(table_name):
+    """Fato do IPCA-15: áreas disponíveis, variáveis e categorias do agregado 7062."""
     try:
         print(f"Buscando e processando a FATO UNIFICADA: {table_name}...")
-        base = f"{API}/v3/agregados/{AGREGADO_IPCA}"
+        base = f"{API}/v3/agregados/{AGREGADO_IPCA15}"
 
         meta = buscar_json(f"{base}/metadados")
         variaveis_ids = [v["id"] for v in meta["variaveis"]]
         print(f"   Variáveis encontradas: {variaveis_ids}")
 
-        periodos = lista_periodos(ANO_INICIO)
+        periodos = lista_periodos(base)
         blocos = [periodos[i:i + MESES_POR_REQUISICAO] for i in range(0, len(periodos), MESES_POR_REQUISICAO)]
 
         linhas_fato = []
@@ -258,15 +259,15 @@ if __name__ == "__main__":
     carregar_dados_gerais(f"{API}/v1/localidades/mesorregioes?orderBy=nome", "dim_mesorregioes")
     carregar_dados_gerais(f"{API}/v1/localidades/municipios", "dim_municipios")
 
-    # Metadados do agregado 7060 (nomes "ipp" mantidos para não quebrar o que já existe no banco/Power BI)
-    carregar_dados_gerais(f"{API}/v3/agregados/{AGREGADO_IPCA}/periodos", "aux_ipp_periodos")
+    # Nomes "ipp" mantidos para não quebrar o que já existe no banco/Power BI.
+    carregar_dados_gerais(f"{API}/v3/agregados/{AGREGADO_IPCA15}/periodos", "aux_ipp_periodos")
     carregar_dados_gerais(
-        f"{API}/v3/agregados/{AGREGADO_IPCA}/metadados", "meta_ipp_descritivo",
+        f"{API}/v3/agregados/{AGREGADO_IPCA15}/metadados", "meta_ipp_descritivo",
         force_longtext=["variaveis", "classificacoes"],
     )
 
-    # Fato do IPCA (nome da tabela mantido; agora contém Brasil + RMs + municípios + todas as categorias)
-    carregar_fato_ipca("fat_ipca_brasil")
+    # Nome da tabela mantido para preservar a conexão existente com o Power BI.
+    carregar_fato_ipca15("fat_ipca_brasil")
 
     # Metadados gerais
     carregar_dados_gerais(f"{API}/v2/metadados/pesquisas", "meta_pesquisas")
