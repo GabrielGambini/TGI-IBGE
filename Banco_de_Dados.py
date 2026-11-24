@@ -1,9 +1,13 @@
-import requests
-import pandas as pd
-from sqlalchemy import create_engine
-from sqlalchemy.dialects.mysql import LONGTEXT
-import urllib.parse
 import json
+import urllib.parse
+from datetime import date
+
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from sqlalchemy import create_engine, text
+from sqlalchemy.dialects.mysql import DOUBLE, LONGTEXT, VARCHAR
+from urllib3.util.retry import Retry
 
 # --- CONFIGURAÇÃO DE ACESSO AO BANCO DE DADOS ---
 usuario = 'root'
@@ -14,16 +18,38 @@ banco = 'tgi_ibge'
 
 engine = create_engine(f'mysql+pymysql://{usuario}:{senha}@{host}:{porta}/{banco}')
 
+# --- CONFIGURAÇÃO DA API ---
+API = "https://servicodados.ibge.gov.br/api"
+AGREGADO_IPCA = 7060  # Tabela 7060 do SIDRA: IPCA (a partir de jan/2020)
+# Brasil (N1) + Regiões Metropolitanas (N7) + Municípios (N6) = as 16 áreas do IPCA + total nacional
+LOCALIDADES = "N1[all]|N7[all]|N6[all]"
+CLASSIFICACAO = "315[all]"  # índice geral, grupos, subgrupos, itens e subitens
+ANO_INICIO = 2020
+MESES_POR_REQUISICAO = 3  # evita estourar o limite de valores por requisição do SIDRA
+
+http = requests.Session()
+http.mount(
+    "https://",
+    HTTPAdapter(max_retries=Retry(total=3, backoff_factor=2, status_forcelist=[429, 502, 503, 504])),
+)
+
+
+def buscar_json(url, timeout=120):
+    resp = http.get(url, timeout=timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code} em {url} -> {resp.text[:200]}")
+    return resp.json()
+
 
 def registrar_log(tabela, status, lines=0, erro=None):
     try:
         log_df = pd.DataFrame([{
-            'tabela_destino': tabela,
-            'status': status,
-            'total_linhas': lines,
-            'mensagem_erro': str(erro) if erro else None
+            "tabela_destino": tabela,
+            "status": status,
+            "total_linhas": lines,
+            "mensagem_erro": str(erro) if erro else None,
         }])
-        log_df.to_sql('logs_pipeline', con=engine, if_exists='append', index=False)
+        log_df.to_sql("logs_pipeline", con=engine, if_exists="append", index=False)
     except Exception as e:
         print(f"⚠️ Erro ao gravar log: {e}")
 
@@ -31,81 +57,187 @@ def registrar_log(tabela, status, lines=0, erro=None):
 def carregar_dados_gerais(url, table_name, force_longtext=None):
     try:
         print(f"Buscando dados para: {table_name}...")
-        response = requests.get(url, timeout=30)
-        if response.status_code == 200:
-            data = response.json()
-            df = pd.json_normalize(data)
-            for col in df.columns:
-                if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
-                    df[col] = df[col].apply(lambda x: json.dumps(x) if x is not None else None)
-            dtype_dict = {}
-            if force_longtext:
-                for col in force_longtext:
-                    if col in df.columns:
-                        dtype_dict[col] = LONGTEXT
-            if not df.empty:
-                df.to_sql(table_name, con=engine, if_exists='replace', index=False, dtype=dtype_dict)
-                print(f"✅ Tabela '{table_name}' carregada com sucesso!")
-                registrar_log(table_name, "Sucesso", len(df))
+        data = buscar_json(url, timeout=60)
+
+        # Aviso se a API paginar (ex.: calendário) e estivermos pegando só a primeira página
+        if isinstance(data, dict) and data.get("totalPages", 1) > 1:
+            aviso = f"Resposta paginada ({data.get('totalPages')} páginas); só a 1ª foi carregada."
+            print(f"⚠️ {table_name}: {aviso}")
+            registrar_log(table_name, "Aviso", 0, aviso)
+
+        df = pd.json_normalize(data)
+        for col in df.columns:
+            if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
+                df[col] = df[col].apply(lambda x: json.dumps(x) if x is not None else None)
+
+        dtype_dict = {}
+        for col in force_longtext or []:
+            if col in df.columns:
+                dtype_dict[col] = LONGTEXT
+
+        if df.empty:
+            print(f"⚠️ '{table_name}' veio vazia, tabela não alterada.")
+            registrar_log(table_name, "Vazio", 0)
+            return
+
+        df.to_sql(table_name, con=engine, if_exists="replace", index=False, dtype=dtype_dict)
+        print(f"✅ Tabela '{table_name}' carregada com sucesso! ({len(df)} linhas)")
+        registrar_log(table_name, "Sucesso", len(df))
     except Exception as e:
+        print(f"⚠️ Falha em '{table_name}': {e}")
         registrar_log(table_name, "Erro Técnico", 0, str(e))
 
 
-def carregar_fato_ipca_regional(url, table_name):
+def converter_valor(v):
+    """Converte o valor do SIDRA. '-' é zero real; 'X', '..', '...' e vazio são dado ausente/sigiloso."""
+    if v is None:
+        return None
+    v = str(v).strip()
+    if v == "-":
+        return 0.0
+    if v in ("", "X", "..", "..."):
+        return None
     try:
-        print(f"Buscando e processando a FATO REGIONAL UNIFICADA: {table_name}...")
-        response = requests.get(url, timeout=60)
-        if response.status_code == 200:
-            data = response.json()
-            linhas_fato = []
-            for variavel in data:
-                indicador_id = variavel.get('id')
-                indicador_nome = variavel.get('variavel')
-                unidade = variavel.get('unidade')
-                for res in variavel.get('resultados', []):
-                    for boco_serie in res.get('series', []):
-                        localidade_id = boco_serie.get('localidade', {}).get('id')
-                        localidade_nome = boco_serie.get('localidade', {}).get('nome')
-                        for periodo, valor in boco_serie.get('serie', {}).items():
-                            if valor not in [None, "-", "", "..."]:
+        return float(v)
+    except ValueError:
+        return None
+
+
+def lista_periodos(ano_inicio):
+    hoje = date.today()
+    return [
+        f"{ano}{mes:02d}"
+        for ano in range(ano_inicio, hoje.year + 1)
+        for mes in range(1, 13)
+        if (ano, mes) <= (hoje.year, hoje.month)
+    ]
+
+
+def carregar_fato_ipca(table_name):
+    """Fato do IPCA: Brasil + RMs + municípios, todas as variáveis e todas as categorias."""
+    try:
+        print(f"Buscando e processando a FATO UNIFICADA: {table_name}...")
+        base = f"{API}/v3/agregados/{AGREGADO_IPCA}"
+
+        meta = buscar_json(f"{base}/metadados")
+        variaveis_ids = [v["id"] for v in meta["variaveis"]]
+        print(f"   Variáveis encontradas: {variaveis_ids}")
+
+        periodos = lista_periodos(ANO_INICIO)
+        blocos = [periodos[i:i + MESES_POR_REQUISICAO] for i in range(0, len(periodos), MESES_POR_REQUISICAO)]
+
+        linhas_fato = []
+        erros = []
+
+        for var_id in variaveis_ids:
+            for bloco in blocos:
+                intervalo = f"{bloco[0]}-{bloco[-1]}" if len(bloco) > 1 else bloco[0]
+                url = (
+                    f"{base}/periodos/{intervalo}/variaveis/{var_id}"
+                    f"?localidades={LOCALIDADES}&classificacao={CLASSIFICACAO}"
+                )
+                try:
+                    data = buscar_json(url)
+                except Exception as e:
+                    erros.append(f"var {var_id} períodos {intervalo}: {e}")
+                    continue
+
+                for variavel in data:
+                    for res in variavel.get("resultados", []):
+                        categorias = {}
+                        for classif in res.get("classificacoes", []):
+                            categorias.update(classif.get("categoria", {}))
+                        categoria_id, categoria_nome = next(iter(categorias.items()), (None, None))
+
+                        for serie in res.get("series", []):
+                            loc = serie.get("localidade", {})
+                            for periodo, valor in serie.get("serie", {}).items():
+                                valor_num = converter_valor(valor)
+                                if valor_num is None:
+                                    continue
                                 linhas_fato.append({
-                                    'indicador_id': indicador_id,
-                                    'indicador_nome': indicador_nome,
-                                    'unidade_medida': unidade,
-                                    'localidade_id': localidade_id,
-                                    'localidade_nome': localidade_nome,
-                                    'periodo_id': periodo,
-                                    'valor_indice': float(valor)
+                                    "indicador_id": variavel.get("id"),
+                                    "indicador_nome": variavel.get("variavel"),
+                                    "unidade_medida": variavel.get("unidade"),
+                                    "nivel_territorial": loc.get("nivel", {}).get("id"),
+                                    "localidade_id": loc.get("id"),
+                                    "localidade_nome": loc.get("nome"),
+                                    "categoria_id": categoria_id,
+                                    "categoria_nome": categoria_nome,
+                                    "periodo_id": periodo,
+                                    "valor_indice": valor_num,
                                 })
-            df_fato = pd.DataFrame(linhas_fato)
-            if not df_fato.empty:
-                df_fato.to_sql(table_name, con=engine, if_exists='replace', index=False)
-                print(f"✅ Nova FATO Regional '{table_name}' carregada! Total: {len(df_fato)} linhas.")
-                registrar_log(table_name, "Sucesso", len(df_fato))
+            print(f"   Variável {var_id} concluída. Linhas acumuladas: {len(linhas_fato)}")
+
+        # Se algum bloco falhou, NÃO sobrescreve a tabela: uma fato parcial enganaria o dashboard.
+        if erros:
+            print(f"⚠️ {len(erros)} requisição(ões) falharam; tabela '{table_name}' NÃO foi alterada.")
+            registrar_log(table_name, "Erro Parcial", 0, " | ".join(erros[:5]))
+            return
+
+        df_fato = pd.DataFrame(linhas_fato)
+        if df_fato.empty:
+            print(f"⚠️ Fato '{table_name}' veio vazia, tabela não alterada.")
+            registrar_log(table_name, "Vazio", 0)
+            return
+
+        dtype_fato = {
+            "indicador_id": VARCHAR(10),
+            "indicador_nome": VARCHAR(255),
+            "unidade_medida": VARCHAR(100),
+            "nivel_territorial": VARCHAR(5),
+            "localidade_id": VARCHAR(10),
+            "localidade_nome": VARCHAR(100),
+            "categoria_id": VARCHAR(15),
+            "categoria_nome": VARCHAR(255),
+            "periodo_id": VARCHAR(6),
+            "valor_indice": DOUBLE,
+        }
+        df_fato.to_sql(
+            table_name, con=engine, if_exists="replace", index=False,
+            dtype=dtype_fato, chunksize=5000, method="multi",
+        )
+
+        # Índice para acelerar os joins/filtros do Power BI
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f"CREATE INDEX idx_{table_name}_busca "
+                    f"ON {table_name} (periodo_id, localidade_id, categoria_id, indicador_id)"
+                ))
+        except Exception as e:
+            print(f"⚠️ Não foi possível criar o índice: {e}")
+
+        print(f"✅ FATO '{table_name}' carregada! Total: {len(df_fato)} linhas.")
+        print(f"   Localidades distintas: {df_fato['localidade_id'].nunique()} | "
+              f"Categorias distintas: {df_fato['categoria_id'].nunique()}")
+        registrar_log(table_name, "Sucesso", len(df_fato))
     except Exception as e:
         print(f"⚠️ Falha técnica na FATO: {e}")
         registrar_log(table_name, "Erro Técnico", 0, str(e))
 
 
 if __name__ == "__main__":
-    print("=== INICIANDO PIPELINE DE VOLTA DOS ESTADOS COMPLETA ===\n")
+    print("=== INICIANDO PIPELINE IBGE ===\n")
 
-    carregar_dados_gerais("https://servicodados.ibge.gov.br/api/v1/localidades/regioes?orderBy=nome", "dim_regioes")
-    carregar_dados_gerais("https://servicodados.ibge.gov.br/api/v1/localidades/estados?orderBy=nome", "dim_estados")
-    carregar_dados_gerais("https://servicodados.ibge.gov.br/api/v1/localidades/mesorregioes?orderBy=nome",
-                          "dim_mesorregioes")
-    carregar_dados_gerais("https://servicodados.ibge.gov.br/api/v1/localidades/municipios", "dim_municipios")
+    # Dimensões geográficas
+    carregar_dados_gerais(f"{API}/v1/localidades/regioes?orderBy=nome", "dim_regioes")
+    carregar_dados_gerais(f"{API}/v1/localidades/estados?orderBy=nome", "dim_estados")
+    carregar_dados_gerais(f"{API}/v1/localidades/mesorregioes?orderBy=nome", "dim_mesorregioes")
+    carregar_dados_gerais(f"{API}/v1/localidades/municipios", "dim_municipios")
 
-    carregar_dados_gerais("https://servicodados.ibge.gov.br/api/v3/agregados/7060/periodos", "aux_ipp_periodos")
-    carregar_dados_gerais("https://servicodados.ibge.gov.br/api/v3/agregados/7060/metadados", "meta_ipp_descritivo",
-                          force_longtext=['variaveis', 'classificacoes'])
+    # Metadados do agregado 7060 (nomes "ipp" mantidos para não quebrar o que já existe no banco/Power BI)
+    carregar_dados_gerais(f"{API}/v3/agregados/{AGREGADO_IPCA}/periodos", "aux_ipp_periodos")
+    carregar_dados_gerais(
+        f"{API}/v3/agregados/{AGREGADO_IPCA}/metadados", "meta_ipp_descritivo",
+        force_longtext=["variaveis", "classificacoes"],
+    )
 
-    # MUDANÇA DA URL AQUI: Trocado localidades=BR para localidades=N7 (Regiões Metropolitanas de 2020 a 2026)
-    url_regional = "https://servicodados.ibge.gov.br/api/v3/agregados/7060/periodos/202001-202612/variaveis?localidades=N7"
-    carregar_fato_ipca_regional(url_regional, "fat_ipca_brasil")
+    # Fato do IPCA (nome da tabela mantido; agora contém Brasil + RMs + municípios + todas as categorias)
+    carregar_fato_ipca("fat_ipca_brasil")
 
-    carregar_dados_gerais("https://servicodados.ibge.gov.br/api/v2/metadados/pesquisas", "meta_pesquisas")
-    carregar_dados_gerais("https://servicodados.ibge.gov.br/api/v3/calendario/?de=2018-12-20", "meta_calendario_geral",
-                          force_longtext=['items'])
+    # Metadados gerais
+    carregar_dados_gerais(f"{API}/v2/metadados/pesquisas", "meta_pesquisas")
+    carregar_dados_gerais(f"{API}/v3/calendario/?de=2018-12-20", "meta_calendario_geral", force_longtext=["items"])
 
-    print("\n--- PIPELINE ATUALIZADA FINALIZADA COM SUCESSO ---")
+    print("\n--- PIPELINE FINALIZADA. Confira a tabela logs_pipeline para ver o status de cada carga. ---")
