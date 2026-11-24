@@ -2,15 +2,20 @@ name: Atualizar banco de dados do IBGE
 
 on:
   schedule:
-    - cron: "0 9 1 * *"
+    - cron: "0 12 15 * *"   # dia 15, 12:00 UTC (09:00 em Brasília)
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: atualizar-banco
+  cancel-in-progress: false
+
 jobs:
   atualizar-banco:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     env:
       DB_USER: ${{ secrets.DB_USER }}
       DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
@@ -30,4 +35,4 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Atualizar dados
-        run: python Banco_de_Dados.py
+        run: python -u Banco_de_Dados.py
