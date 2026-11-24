@@ -15,7 +15,7 @@ USAR_NUVEM = True  # True = TiDB Cloud | False = MySQL local
 
 if USAR_NUVEM:
     usuario = 'QQPXk1HfakbEwks.root'
-    senha = urllib.parse.quote_plus('COLE_A_NOVA_SENHA_AQUI')
+    senha = urllib.parse.quote_plus('mwKVSJ3CFX6Zp9Q8')
     host = 'gateway01.sa-east-1.prod.aws.tidbcloud.com'
     porta = '4000'
 else:
