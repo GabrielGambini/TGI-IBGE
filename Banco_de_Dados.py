@@ -1,4 +1,5 @@
 import json
+import os
 import urllib.parse
 
 import certifi
@@ -10,20 +11,17 @@ from sqlalchemy.dialects.mysql import DOUBLE, LONGTEXT, VARCHAR
 from urllib3.util.retry import Retry
 
 # --- CONFIGURAÇÃO DE ACESSO AO BANCO DE DADOS ---
-USAR_NUVEM = True  # True = TiDB Cloud | False = MySQL local
+USAR_NUVEM = os.getenv("USAR_NUVEM", "true").lower() == "true"
+usuario = os.environ["DB_USER"]
+senha = urllib.parse.quote_plus(os.environ["DB_PASSWORD"])
+banco = os.getenv("DB_NAME", "tgi_ibge")
 
 if USAR_NUVEM:
-    usuario = 'QQPXk1HfakbEwks.root'
-    senha = urllib.parse.quote_plus('mwKVSJ3CFX6Zp9Q8')
-    host = 'gateway01.sa-east-1.prod.aws.tidbcloud.com'
-    porta = '4000'
+    host = os.getenv("DB_HOST", "gateway01.sa-east-1.prod.aws.tidbcloud.com")
+    porta = os.getenv("DB_PORT", "4000")
 else:
-    usuario = 'root'
-    senha = urllib.parse.quote_plus('91574455Ab@2026')
-    host = 'localhost'
-    porta = '3306'
-
-banco = 'tgi_ibge'
+    host = os.getenv("DB_HOST", "localhost")
+    porta = os.getenv("DB_PORT", "3306")
 
 # Bancos na nuvem exigem conexão com SSL
 connect_args = {"ssl": {"ca": certifi.where()}} if USAR_NUVEM else {}
@@ -57,6 +55,8 @@ http.mount(
     "https://",
     HTTPAdapter(max_retries=Retry(total=3, backoff_factor=2, status_forcelist=[429, 502, 503, 504])),
 )
+
+falhas_pipeline = []
 
 
 def buscar_json(url, timeout=120):
@@ -110,6 +110,7 @@ def carregar_dados_gerais(url, table_name, force_longtext=None):
         registrar_log(table_name, "Sucesso", len(df))
     except Exception as e:
         print(f"⚠️ Falha em '{table_name}': {e}")
+        falhas_pipeline.append(f"{table_name}: {e}")
         registrar_log(table_name, "Erro Técnico", 0, str(e))
 
 
@@ -199,6 +200,7 @@ def carregar_fato_ipca15(table_name):
         # Se algum bloco falhou, NÃO sobrescreve a tabela: uma fato parcial enganaria o dashboard.
         if erros:
             print(f"⚠️ {len(erros)} requisição(ões) falharam; tabela '{table_name}' NÃO foi alterada.")
+            falhas_pipeline.append(f"{table_name}: {len(erros)} requisição(ões) falharam")
             registrar_log(table_name, "Erro Parcial", 0, " | ".join(erros[:5]))
             return
 
@@ -247,6 +249,7 @@ def carregar_fato_ipca15(table_name):
         registrar_log(table_name, "Sucesso", len(df_fato))
     except Exception as e:
         print(f"⚠️ Falha técnica na FATO: {e}")
+        falhas_pipeline.append(f"{table_name}: {e}")
         registrar_log(table_name, "Erro Técnico", 0, str(e))
 
 
@@ -274,3 +277,5 @@ if __name__ == "__main__":
     carregar_dados_gerais(f"{API}/v3/calendario/?de=2018-12-20", "meta_calendario_geral", force_longtext=["items"])
 
     print("\n--- PIPELINE FINALIZADA. Confira a tabela logs_pipeline para ver o status de cada carga. ---")
+    if falhas_pipeline:
+        raise SystemExit(f"Pipeline finalizada com {len(falhas_pipeline)} falha(s).")
