@@ -4,7 +4,7 @@
 export const IBGE_URL = "https://www.ibge.gov.br/estatisticas/economicas/precos-e-custos/9260-indice-nacional-de-precos-ao-consumidor-amplo-15.html";
 export const SIDRA_URL = "https://sidra.ibge.gov.br/tabela/3065";
 export const POWERBI_URL =
-  "https://app.powerbi.com/view?r=eyJrIjoiOTllNTI5MGItNGFiOS00ZmZjLWFmNjktNjY2ZWNmZWEwZDRkIiwidCI6ImU0Y2MyMmIwLWM0M2YtNGUzMi1hMmU1LWEwMzRkN2RmMzUwMCJ9";
+  "https://app.powerbi.com/view?r=eyJrIjoiNWMzOGI2YjMtMGMwMC00MTA2LTgzY2QtOWViMjEwYmU5YTZlIiwidCI6ImU0Y2MyMmIwLWM0M2YtNGUzMi1hMmU1LWEwMzRkN2RmMzUwMCJ9";
 
 export const DATA_META = { referencia: "Outubro de 2026", divulgacao: "23/10/2026", fonte: "IBGE" };
 
