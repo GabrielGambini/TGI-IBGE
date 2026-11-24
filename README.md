@@ -7,7 +7,7 @@ Dados em src/data.ts (IBGE, IPCA-15 out/2026). Atualize a cada divulgação ou i
 
 ## Atualização mensal do banco
 
-O GitHub Actions executa `Banco_de_Dados.py` no dia 1 de cada mês, às 09:00 UTC, e também pode ser iniciado manualmente pela aba **Actions**.
+O GitHub Actions executa `Banco_de_Dados.py` no dia 15 de cada mês, às 09:00 UTC, e também pode ser iniciado manualmente pela aba **Actions**.
 
 Configure estes secrets do repositório em **Settings > Secrets and variables > Actions**:
 
